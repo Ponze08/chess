@@ -1,0 +1,11 @@
+{
+  "name": "chess",
+  "version": "1.0.0",
+  "description": "Play chess against a computer opponent in the browser. No dependencies.",
+  "scripts": {
+    "test": "node test/perft.js && node test/engine-play.js",
+    "start": "npx --yes http-server . -p 8080 -o"
+  },
+  "license": "MIT",
+  "private": true
+}

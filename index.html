@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess — You vs the Computer</title>
+<meta name="description" content="Play chess against a computer opponent in your browser. No installs, no dependencies.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9822;</text></svg>">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <h1>Chess</h1>
+  <p class="masthead__sub">You versus the computer</p>
+</header>
+
+<main class="layout">
+
+  <section class="board-column">
+    <div class="captured" id="capturedTop" aria-live="off"></div>
+
+    <div class="board-stage">
+      <div class="evalbar" id="evalbar" title="Engine evaluation">
+        <div class="evalbar__fill" id="evalbarFill"></div>
+      </div>
+
+      <div class="board-frame">
+        <div class="board" id="board" role="grid" aria-label="Chess board"></div>
+        <div class="board-veil" id="boardVeil" hidden></div>
+      </div>
+    </div>
+
+    <div class="captured" id="capturedBottom" aria-live="off"></div>
+  </section>
+
+  <aside class="panel">
+
+    <div class="status" id="status" role="status" aria-live="polite">
+      <span class="status__dot" id="statusDot"></span>
+      <span class="status__text" id="statusText">Your move.</span>
+    </div>
+
+    <div class="engine-line" id="engineLine">&nbsp;</div>
+
+    <div class="controls">
+      <button class="btn btn--primary" id="btnNew" type="button">New game</button>
+      <button class="btn" id="btnUndo" type="button">Undo</button>
+      <button class="btn" id="btnHint" type="button">Hint</button>
+      <button class="btn" id="btnFlip" type="button">Flip</button>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="selLevel">Difficulty</label>
+      <select class="select" id="selLevel">
+        <option value="easy">Easy</option>
+        <option value="medium" selected>Medium</option>
+        <option value="hard">Hard</option>
+        <option value="expert">Expert</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label class="field__label" for="selSide">You play</label>
+      <select class="select" id="selSide">
+        <option value="w" selected>White</option>
+        <option value="b">Black</option>
+      </select>
+    </div>
+
+    <div class="moves">
+      <div class="moves__head">Moves</div>
+      <ol class="moves__list" id="moveList"></ol>
+    </div>
+
+  </aside>
+</main>
+
+<footer class="footnote">
+  Click a piece then its destination, or drag it. Changing difficulty or side starts a new game.
+</footer>
+
+<div class="modal" id="promotionModal" hidden>
+  <div class="modal__box" role="dialog" aria-modal="true" aria-label="Choose promotion piece">
+    <p class="modal__title">Promote to</p>
+    <div class="modal__choices" id="promotionChoices"></div>
+  </div>
+</div>
+
+<div class="drag-layer" id="dragLayer" hidden></div>
+
+<script src="js/engine.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/ui.js"></script>
+</body>
+</html>

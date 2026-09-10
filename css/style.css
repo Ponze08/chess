@@ -1,0 +1,515 @@
+/* style.css — layout and theme for the chess board and side panel. */
+
+:root {
+  --bg: #16161a;
+  --bg-raised: #1f1f25;
+  --bg-sunken: #121215;
+  --line: #2e2e37;
+  --text: #e8e8ec;
+  --text-dim: #9a9aa6;
+  --accent: #7fa650;
+  --accent-strong: #93bd5e;
+  --danger: #d1495b;
+
+  --square-light: #ebecd0;
+  --square-dark: #739552;
+  --square-light-active: #f5f574;
+  --square-dark-active: #b9ca43;
+  --piece-white: #fbfbf8;
+  --piece-black: #26262b;
+
+  --board-max: 640px;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", Inter, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- Masthead ------------------------------------------------------- */
+
+.masthead {
+  text-align: center;
+  padding: 26px 16px 14px;
+}
+
+.masthead h1 {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+.masthead__sub {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+/* --- Layout --------------------------------------------------------- */
+
+.layout {
+  display: flex;
+  gap: 28px;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 0 20px 28px;
+  flex-wrap: wrap;
+}
+
+.board-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(var(--board-max), 100%);
+}
+
+.board-stage {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
+/* --- Evaluation bar ------------------------------------------------- */
+
+.evalbar {
+  position: relative;
+  width: 14px;
+  flex: 0 0 14px;
+  border-radius: 7px;
+  background: var(--piece-black);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+
+/* Grows from the bottom: taller means better for White. */
+.evalbar__fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 50%;
+  background: var(--piece-white);
+  transition: height 0.35s ease;
+}
+
+/* --- Board ---------------------------------------------------------- */
+
+.board-frame {
+  position: relative;
+  flex: 1 1 auto;
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  aspect-ratio: 1 / 1;
+  width: 100%;
+  touch-action: none;
+  /* Lets pieces and coordinates size against the board rather than the
+     viewport, so they stay proportional at any layout width. */
+  container-type: inline-size;
+}
+
+.square {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  cursor: default;
+}
+
+.square--light { background: var(--square-light); }
+.square--dark  { background: var(--square-dark); }
+
+.square--last.square--light { background: var(--square-light-active); }
+.square--last.square--dark  { background: var(--square-dark-active); }
+
+.square--selected::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 0 4px rgba(255, 255, 255, 0.85);
+}
+
+/* King in check gets a red radial glow. */
+.square--check::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle, rgba(209, 73, 91, 0.95) 12%, rgba(209, 73, 91, 0) 72%);
+}
+
+.square--playable { cursor: pointer; }
+
+/* Coordinate labels, shown only along the two outer edges. */
+.square__rank,
+.square__file {
+  position: absolute;
+  font-size: 9px;             /* fallback where container units are unsupported */
+  font-size: clamp(8px, 2.2cqw, 12px);
+  font-weight: 700;
+  opacity: 0.62;
+  pointer-events: none;
+}
+
+.square__rank { top: 2px; left: 3px; }
+.square__file { bottom: 1px; right: 4px; }
+
+.square--light .square__rank,
+.square--light .square__file { color: var(--square-dark); }
+
+.square--dark .square__rank,
+.square--dark .square__file { color: var(--square-light); }
+
+/* --- Pieces --------------------------------------------------------- */
+
+/* Both colours use the solid glyph set and are separated by fill colour, so
+   the two sides always share identical shapes across platforms. */
+/* A square is 12.5cqw wide, so 9.4cqw fills about three quarters of it.
+   The vw value is a fallback for browsers without container queries. */
+.piece {
+  font-size: clamp(26px, 8vw, 58px);
+  font-size: 9.4cqw;
+  line-height: 1;
+  pointer-events: none;
+  transform: translateY(-2%);
+}
+
+.piece--w {
+  color: var(--piece-white);
+  -webkit-text-stroke: 1.4px #55554e;
+  text-shadow: 0 2px 2px rgba(0, 0, 0, 0.28);
+}
+
+.piece--b {
+  color: var(--piece-black);
+  -webkit-text-stroke: 1.2px #0d0d10;
+  text-shadow: 0 2px 2px rgba(0, 0, 0, 0.22);
+}
+
+.square--dragging .piece { opacity: 0.28; }
+
+/* --- Move hints ----------------------------------------------------- */
+
+.hint-dot {
+  position: absolute;
+  width: 30%;
+  height: 30%;
+  border-radius: 50%;
+  background: rgba(20, 20, 20, 0.28);
+  pointer-events: none;
+}
+
+/* A capture is shown as a ring around the target square instead of a dot. */
+.hint-ring {
+  position: absolute;
+  inset: 6%;
+  border-radius: 50%;
+  border: 5px solid rgba(20, 20, 20, 0.26);
+  pointer-events: none;
+}
+
+.square--suggest::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  box-shadow: inset 0 0 0 5px rgba(127, 166, 80, 0.95);
+}
+
+/* Blocks input while the computer is thinking. */
+.board-veil {
+  position: absolute;
+  inset: 0;
+  cursor: progress;
+}
+
+/* --- Captured pieces ------------------------------------------------ */
+
+.captured {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  min-height: 26px;
+  font-size: 21px;
+  line-height: 1;
+  padding: 0 2px;
+  flex-wrap: wrap;
+}
+
+.captured .piece {
+  font-size: 21px;
+  transform: none;
+}
+
+.captured__edge {
+  margin-left: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-dim);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+/* --- Side panel ----------------------------------------------------- */
+
+.panel {
+  width: 290px;
+  flex: 0 0 auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  min-height: 22px;
+}
+
+.status__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: 0 0 auto;
+}
+
+.status--thinking .status__dot { animation: pulse 1.05s ease-in-out infinite; }
+.status--over .status__dot { background: var(--danger); }
+.status--check .status__dot { background: var(--danger); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.35; transform: scale(0.72); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status--thinking .status__dot { animation: none; }
+  .evalbar__fill { transition: none; }
+}
+
+.engine-line {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  min-height: 15px;
+  margin-top: -8px;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--bg-sunken);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 13.5px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) { background: #26262e; border-color: #3c3c48; }
+
+.btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #10160a;
+}
+
+.btn--primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.field__label {
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.select {
+  flex: 1 1 auto;
+  max-width: 148px;
+  background: var(--bg-sunken);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font-size: 13.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* --- Move list ------------------------------------------------------ */
+
+.moves {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.moves__head {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-dim);
+  font-weight: 700;
+  margin-bottom: 7px;
+}
+
+.moves__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  height: 232px;
+  overflow-y: auto;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+}
+
+.moves__row {
+  display: grid;
+  grid-template-columns: 30px 1fr 1fr;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 5px;
+}
+
+.moves__row:nth-child(odd) { background: rgba(255, 255, 255, 0.028); }
+.moves__num { color: var(--text-dim); }
+.moves__ply--latest { color: var(--accent-strong); font-weight: 700; }
+
+.moves__empty {
+  color: var(--text-dim);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 4px;
+}
+
+/* --- Promotion dialog ----------------------------------------------- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+}
+
+.modal[hidden] { display: none; }
+
+.modal__box {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  text-align: center;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.6);
+}
+
+.modal__title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text-dim);
+}
+
+.modal__choices { display: flex; gap: 8px; }
+
+.promo-btn {
+  width: 62px;
+  height: 62px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--square-light);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.promo-btn:hover { border-color: var(--accent); }
+.promo-btn .piece { font-size: 42px; }
+
+/* --- Drag layer ----------------------------------------------------- */
+
+.drag-layer {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.drag-layer[hidden] { display: none; }
+
+.drag-piece {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  line-height: 1;
+  filter: drop-shadow(0 6px 8px rgba(0, 0, 0, 0.45));
+}
+
+/* --- Footer --------------------------------------------------------- */
+
+.footnote {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  padding: 0 20px 34px;
+}
+
+/* --- Narrow screens -------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .layout { gap: 18px; }
+  .panel { width: min(var(--board-max), 100%); }
+  .moves__list { height: 150px; }
+}
+
+/* When the board is flipped, the bar tracks Black at the bottom instead. */
+.evalbar--flip { background: var(--piece-white); }
+.evalbar--flip .evalbar__fill { background: var(--piece-black); }
