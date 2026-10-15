@@ -1,11 +1,16 @@
 {
   "name": "chess",
   "version": "1.0.0",
-  "description": "Play chess against a computer opponent in the browser. No dependencies.",
+  "description": "Play chess in the browser against the computer or a friend, on one device or online. No build step.",
   "scripts": {
     "test": "node test/perft.js && node test/engine-play.js",
+    "test:browser": "node test/browser.js",
     "start": "npx --yes http-server . -p 8080 -o"
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "peer": "1.0.2",
+    "playwright": "1.56.1"
+  }
 }
