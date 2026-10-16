@@ -12,7 +12,7 @@ self.onmessage = function (e) {
   var req = e.data;
   try {
     var pos = self.Chess.parseFEN(req.fen);
-    var result = self.ChessAI.chooseMove(pos, req.level);
+    var result = self.ChessAI.chooseMove(pos, req.level, req.history);
     if (!result) {
       self.postMessage({ id: req.id, move: null });
       return;

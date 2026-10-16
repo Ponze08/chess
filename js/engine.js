@@ -137,6 +137,12 @@
     if (rights.indexOf('q') !== -1) pos.castling |= BQ;
 
     pos.ep = (parts[3] && parts[3] !== '-') ? fromAlgebraic(parts[3]) : -1;
+    // Keep the square only when a pawn could actually take en passant, the
+    // same rule makeMove follows, so equal positions always hash equally.
+    if (pos.ep !== -1) {
+      var pushed = pos.turn === WHITE ? pos.ep + 8 : pos.ep - 8;
+      if (!epCapturePossible(pos.board, pushed, pos.turn)) pos.ep = -1;
+    }
     pos.halfmove = parts[4] ? Number(parts[4]) : 0;
     pos.fullmove = parts[5] ? Number(parts[5]) : 1;
 
@@ -406,6 +412,16 @@
     }
   }
 
+  // True if a `by` pawn stands beside the pawn that just double-pushed to
+  // `pushed`. The en passant square is only recorded in that case: otherwise
+  // it would make the same position hash differently depending on whether
+  // the last move was a double push, and threefold repetition would be missed.
+  function epCapturePossible(board, pushed, by) {
+    var pawn = by === WHITE ? 'P' : 'p';
+    var c = colOf(pushed);
+    return (c > 0 && board[pushed - 1] === pawn) || (c < 7 && board[pushed + 1] === pawn);
+  }
+
   function makeMove(pos, m) {
     pos.undoStack.push({
       move: m,
@@ -450,7 +466,8 @@
     pos.castling &= ~(castlingMask(m.from) | castlingMask(m.to));
     xorKey(pos, CASTLE_KEYS[pos.castling]);
 
-    pos.ep = m.flag === 'double' ? (m.from + m.to) / 2 : -1;
+    pos.ep = m.flag === 'double' && epCapturePossible(b, m.to, opponent(us))
+      ? (m.from + m.to) / 2 : -1;
     if (pos.ep !== -1) xorKey(pos, EP_KEYS[colOf(pos.ep)]);
 
     if (typeOf(m.piece) === 'p' || m.captured !== null) pos.halfmove = 0;
@@ -523,6 +540,26 @@
   }
 
   // --- Notation ---------------------------------------------------------
+
+  // Long algebraic "UCI" notation, e.g. e2e4 or e7e8q. Compact and
+  // unambiguous, which is why it is the format moves travel in online.
+  function toUCI(move) {
+    return toAlgebraic(move.from) + toAlgebraic(move.to) +
+      (move.promotion ? move.promotion.toLowerCase() : '');
+  }
+
+  // The legal move `uci` describes in `pos`, or null if it is not one.
+  function fromUCI(pos, uci) {
+    if (typeof uci !== 'string' || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) return null;
+    var from = fromAlgebraic(uci.slice(0, 2));
+    var to = fromAlgebraic(uci.slice(2, 4));
+    var promo = uci[4] || null;
+    var matches = legalMoves(pos).filter(function (m) {
+      return m.from === from && m.to === to &&
+        (m.promotion ? m.promotion.toLowerCase() : null) === promo;
+    });
+    return matches[0] || null;
+  }
 
   // Standard algebraic notation. Needs the legal move list of the position
   // *before* the move, to work out how much disambiguation is required.
@@ -607,6 +644,8 @@
     makeMove: makeMove,
     unmakeMove: unmakeMove,
     toSAN: toSAN,
+    toUCI: toUCI,
+    fromUCI: fromUCI,
     hasInsufficientMaterial: hasInsufficientMaterial
   };
 })(typeof self !== 'undefined' ? self : this);

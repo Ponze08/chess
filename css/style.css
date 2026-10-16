@@ -24,6 +24,10 @@
 
 * { box-sizing: border-box; }
 
+/* Several components set their own display, which would otherwise beat the
+   browser's built-in rule for the hidden attribute. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -229,14 +233,46 @@ html, body {
   box-shadow: inset 0 0 0 5px rgba(127, 166, 80, 0.95);
 }
 
-/* Blocks input while the computer is thinking. */
+/* Blocks input whenever it is not your move. */
 .board-veil {
   position: absolute;
   inset: 0;
-  cursor: progress;
+  cursor: default;
 }
 
-/* --- Captured pieces ------------------------------------------------ */
+.board-veil--busy { cursor: progress; }
+
+/* --- Players and captured pieces ------------------------------------ */
+
+.player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 2px;
+}
+
+.player__swatch {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 1px solid #55554e;
+}
+
+.player__swatch--w { background: var(--piece-white); }
+.player__swatch--b { background: var(--piece-black); border-color: #6a6a74; }
+
+.player__name {
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Whoever is to move gets a lit name and a marker. */
+.player--turn .player__name { color: var(--text); }
+.player--turn .player__swatch { box-shadow: 0 0 0 3px rgba(127, 166, 80, 0.55); }
 
 .captured {
   display: flex;
@@ -274,6 +310,49 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+/* Opponent picker: a segmented control built from radio buttons, so it is
+   keyboard- and screen-reader-friendly for free. */
+.modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px;
+  padding: 3px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.modes__opt { position: relative; }
+
+.modes__opt input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.modes__opt span {
+  display: block;
+  text-align: center;
+  padding: 7px 4px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text-dim);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.modes__opt input:hover + span { color: var(--text); }
+.modes__opt input:checked + span { background: var(--accent); color: #10160a; }
+.modes__opt input:focus-visible + span { outline: 2px solid var(--accent-strong); outline-offset: 1px; }
+
+.modes__hint {
+  margin: -6px 0 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
 }
 
 .status {
@@ -364,6 +443,108 @@ html, body {
   font-size: 13px;
   color: var(--text-dim);
   font-weight: 600;
+}
+
+.btn--wide { width: 100%; }
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* --- Online lobby and offers ---------------------------------------- */
+
+.lobby {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.lobby__start {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.lobby__note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.lobby__retry {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.lobby__retry .btn:only-child { grid-column: 1 / -1; }
+
+.invite {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.invite__row {
+  display: flex;
+  gap: 6px;
+}
+
+.invite__link {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg-sunken);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 9px;
+  font-size: 12.5px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.invite__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.invite__actions .btn { flex: 1 1 0; }
+
+.offer {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.offer__text {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.offer__actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
 }
 
 .select {

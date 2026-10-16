@@ -70,5 +70,59 @@ var zobristOk = hashesAgree(
 console.log((zobristOk ? 'ok  ' : 'FAIL') + '  zobrist hash stays in sync with make/unmake');
 if (!zobristOk) failures++;
 
+function check(name, ok, detail) {
+  if (!ok) failures++;
+  console.log((ok ? 'ok  ' : 'FAIL') + '  ' + name + (detail ? '   ' + detail : ''));
+}
+
+// Plays UCI moves and returns the key of every position along the way.
+function play(pos, ucis) {
+  var keys = [pos.key()];
+  ucis.forEach(function (u) {
+    var m = C.fromUCI(pos, u);
+    if (!m) throw new Error('illegal test move ' + u);
+    C.makeMove(pos, m);
+    keys.push(pos.key());
+  });
+  return keys;
+}
+
+// An en passant square only exists while a pawn can actually use it.
+// Otherwise the same position would hash differently depending on whether
+// the last move happened to be a double push, and repetitions would be lost.
+(function () {
+  var pos = C.parseFEN(C.START_FEN);
+  play(pos, ['e2e4']);
+  check('no en passant square when no pawn can capture', C.toFEN(pos).split(' ')[3] === '-',
+    C.toFEN(pos));
+
+  pos = C.parseFEN(C.START_FEN);
+  play(pos, ['e2e4', 'a7a6', 'e4e5', 'd7d5']);
+  check('en passant square kept when a capture is possible', C.toFEN(pos).split(' ')[3] === 'd6',
+    C.toFEN(pos));
+
+  var a = C.parseFEN('rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2');
+  var b = C.parseFEN('rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2');
+  check('a FEN with an unusable en passant square hashes like one without', a.key() === b.key());
+
+  // 1.e4 e5, then both knights out and back twice: the position after
+  // 1...e5 occurs three times.
+  var keys = play(C.parseFEN(C.START_FEN),
+    'e2e4 e7e5 g1f3 b8c6 f3g1 c6b8 g1f3 b8c6 f3g1 c6b8'.split(' '));
+  var last = keys[keys.length - 1];
+  var seen = keys.filter(function (k) { return k === last; }).length;
+  check('threefold repetition counted across a double pawn push', seen === 3, seen + ' occurrences');
+})();
+
+(function () {
+  var pos = C.parseFEN('8/4P3/8/8/8/8/8/k1K5 w - - 0 1');
+  var m = C.fromUCI(pos, 'e7e8n');
+  check('UCI promotion parses to the right piece', m && m.promotion === 'N');
+  check('UCI round-trips', m && C.toUCI(m) === 'e7e8n');
+  check('UCI promotion without a piece is rejected', C.fromUCI(pos, 'e7e8') === null);
+  check('UCI illegal move is rejected', C.fromUCI(pos, 'e7e6') === null);
+  check('UCI garbage is rejected', C.fromUCI(pos, 'zz9') === null && C.fromUCI(pos, null) === null);
+})();
+
 console.log(failures === 0 ? '\nperft: all checks passed' : '\nperft: ' + failures + ' failure(s)');
 process.exit(failures === 0 ? 0 : 1);

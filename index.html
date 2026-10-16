@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chess — You vs the Computer</title>
-<meta name="description" content="Play chess against a computer opponent in your browser. No installs, no dependencies.">
+<title>Chess — Play the Computer or a Friend</title>
+<meta name="description" content="Play chess in your browser against the computer, a friend on the same device, or a friend online with an invite link. No installs, no sign-up.">
+<meta name="theme-color" content="#16161a">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9822;</text></svg>">
 <link rel="stylesheet" href="css/style.css">
 </head>
@@ -12,13 +13,17 @@
 
 <header class="masthead">
   <h1>Chess</h1>
-  <p class="masthead__sub">You versus the computer</p>
+  <p class="masthead__sub">Play the computer, or a friend</p>
 </header>
 
 <main class="layout">
 
   <section class="board-column">
-    <div class="captured" id="capturedTop" aria-live="off"></div>
+    <div class="player" id="playerTop">
+      <span class="player__swatch" id="swatchTop"></span>
+      <span class="player__name" id="nameTop"></span>
+      <span class="captured" id="capturedTop" aria-live="off"></span>
+    </div>
 
     <div class="board-stage">
       <div class="evalbar" id="evalbar" title="Engine evaluation">
@@ -31,26 +36,84 @@
       </div>
     </div>
 
-    <div class="captured" id="capturedBottom" aria-live="off"></div>
+    <div class="player" id="playerBottom">
+      <span class="player__swatch" id="swatchBottom"></span>
+      <span class="player__name" id="nameBottom"></span>
+      <span class="captured" id="capturedBottom" aria-live="off"></span>
+    </div>
   </section>
 
   <aside class="panel">
+
+    <div class="modes" role="radiogroup" aria-label="Opponent">
+      <label class="modes__opt"><input type="radio" name="mode" value="computer" checked><span>Computer</span></label>
+      <label class="modes__opt"><input type="radio" name="mode" value="local"><span>Friend</span></label>
+      <label class="modes__opt"><input type="radio" name="mode" value="online"><span>Online</span></label>
+    </div>
+    <p class="modes__hint" id="modeHint"></p>
 
     <div class="status" id="status" role="status" aria-live="polite">
       <span class="status__dot" id="statusDot"></span>
       <span class="status__text" id="statusText">Your move.</span>
     </div>
 
-    <div class="engine-line" id="engineLine">&nbsp;</div>
+    <div class="engine-line" id="engineLine" data-modes="computer">&nbsp;</div>
 
-    <div class="controls">
-      <button class="btn btn--primary" id="btnNew" type="button">New game</button>
-      <button class="btn" id="btnUndo" type="button">Undo</button>
-      <button class="btn" id="btnHint" type="button">Hint</button>
-      <button class="btn" id="btnFlip" type="button">Flip</button>
+    <!-- Online, before a game: create an invite, or join one. -->
+    <div class="lobby" id="lobby" hidden>
+      <div class="lobby__start" id="lobbyStart">
+        <div class="field">
+          <label class="field__label" for="selOnlineSide">You play</label>
+          <select class="select" id="selOnlineSide">
+            <option value="w" selected>White</option>
+            <option value="b">Black</option>
+            <option value="random">Random</option>
+          </select>
+        </div>
+        <button class="btn btn--primary btn--wide" id="btnInvite" type="button">Create invite link</button>
+      </div>
+
+      <div class="invite" id="invitePanel" hidden>
+        <label class="field__label" for="inviteLink">Send this link to your friend</label>
+        <div class="invite__row">
+          <input class="invite__link" id="inviteLink" type="text" readonly spellcheck="false">
+          <button class="btn" id="btnCopy" type="button">Copy</button>
+        </div>
+        <div class="invite__actions">
+          <button class="btn" id="btnShare" type="button" hidden>Share…</button>
+          <button class="btn" id="btnCancelInvite" type="button">Cancel</button>
+        </div>
+      </div>
+
+      <div class="lobby__retry" id="lobbyRetry" hidden>
+        <button class="btn btn--primary" id="btnRetry" type="button">Try again</button>
+        <button class="btn" id="btnBackToLobby" type="button">New invite</button>
+      </div>
+
+      <p class="lobby__note">The game runs directly between your two browsers. Your friend just opens the link — no account needed.</p>
     </div>
 
-    <div class="field">
+    <!-- A draw or rematch offer from the friend, or a note about one. -->
+    <div class="offer" id="offer" hidden>
+      <p class="offer__text" id="offerText"></p>
+      <div class="offer__actions" id="offerActions">
+        <button class="btn btn--primary" id="btnAccept" type="button">Accept</button>
+        <button class="btn" id="btnDecline" type="button">Decline</button>
+      </div>
+    </div>
+
+    <div class="controls" id="controls">
+      <button class="btn btn--primary" id="btnNew" type="button" data-modes="computer local">New game</button>
+      <button class="btn" id="btnUndo" type="button" data-modes="computer local">Undo</button>
+      <button class="btn" id="btnHint" type="button" data-modes="computer local">Hint</button>
+      <button class="btn btn--primary" id="btnRematch" type="button" data-modes="online">Rematch</button>
+      <button class="btn" id="btnDraw" type="button" data-modes="online">Offer draw</button>
+      <button class="btn" id="btnResign" type="button" data-modes="online">Resign</button>
+      <button class="btn" id="btnFlip" type="button">Flip</button>
+      <button class="btn" id="btnLeave" type="button" data-modes="online">Leave</button>
+    </div>
+
+    <div class="field" data-modes="computer">
       <label class="field__label" for="selLevel">Difficulty</label>
       <select class="select" id="selLevel">
         <option value="easy">Easy</option>
@@ -60,13 +123,18 @@
       </select>
     </div>
 
-    <div class="field">
+    <div class="field" data-modes="computer">
       <label class="field__label" for="selSide">You play</label>
       <select class="select" id="selSide">
         <option value="w" selected>White</option>
         <option value="b">Black</option>
       </select>
     </div>
+
+    <label class="toggle" data-modes="local">
+      <input type="checkbox" id="chkAutoFlip">
+      <span>Turn the board for whoever is to move</span>
+    </label>
 
     <div class="moves">
       <div class="moves__head">Moves</div>
@@ -76,8 +144,8 @@
   </aside>
 </main>
 
-<footer class="footnote">
-  Click a piece then its destination, or drag it. Changing difficulty or side starts a new game.
+<footer class="footnote" id="footnote">
+  Click a piece then its destination, or drag it.
 </footer>
 
 <div class="modal" id="promotionModal" hidden>
@@ -91,6 +159,7 @@
 
 <script src="js/engine.js"></script>
 <script src="js/ai.js"></script>
+<script src="js/online.js"></script>
 <script src="js/ui.js"></script>
 </body>
 </html>

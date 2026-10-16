@@ -1,36 +1,76 @@
 /*
- * ui.js — board rendering, input handling, and the game loop that alternates
- * between the human player and the engine.
+ * ui.js — board rendering, input handling, and the game loop.
+ *
+ * A game is played against the computer, against a friend on the same
+ * device, or against a friend online. Whichever it is, `controller` says who
+ * is asked for the next move: the person at this screen, the engine, or the
+ * friend at the other end of the connection.
  */
 (function () {
   'use strict';
 
   var C = window.Chess;
   var AI = window.ChessAI;
+  var Online = window.ChessOnline;
 
   // Both colours use the solid glyph set; the fill colour distinguishes them,
-  // so the two sides always have identical silhouettes.
-  var GLYPH = { k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' };
+  // so the two sides always have identical silhouettes. U+FE0E asks for the
+  // text form: the pawn is also an emoji, and phones would otherwise draw it
+  // as a picture that ignores the piece colour.
+  var GLYPH = {
+    k: '♚︎', q: '♛︎', r: '♜︎',
+    b: '♝︎', n: '♞︎', p: '♟︎'
+  };
   var PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
-  var FULL_ARMY = { p: 8, n: 2, b: 2, r: 2, q: 1, k: 1 };
-  var STORAGE_KEY = 'chess.prefs.v1';
+  var CAPTURE_ORDER = 'qrbnp';
+  var LEVEL_NAMES = { easy: 'Easy', medium: 'Medium', hard: 'Hard', expert: 'Expert' };
+  var MODE_HINTS = {
+    computer: 'Play the engine at the difficulty of your choice.',
+    local: 'Two players, one device: take turns at the board.',
+    online: 'Send a friend a link and play over the internet.'
+  };
+
+  var PREFS_KEY = 'chess.prefs.v1';
+  var ONLINE_KEY = 'chess.online.v1';         // sessionStorage: this tab's online game
+  var TOKENS_KEY = 'chess.online.tokens.v1';  // localStorage: our token for each invite
 
   var el = {};
   var state = {
+    mode: 'computer',   // 'computer', 'local' or 'online'
     pos: null,
-    humanColor: C.WHITE,
+    humanColor: C.WHITE,  // your side against the computer
     level: 'medium',
+    autoFlip: false,      // local games: turn the board towards the side to move
     orientation: C.WHITE,
-    moves: [],          // { san, move }
+    moves: [],          // { san, move, evalScore }
     keyHistory: [],     // position keys, for threefold repetition
     selected: -1,
     targets: [],        // legal moves from the selected square
     lastMove: null,
     suggestion: null,   // move highlighted by the Hint button
     result: null,
-    thinking: false,
+    thinking: null,     // null, or 'move' / 'hint' while the engine works
     evalScore: 0,       // centipawns, always from White's point of view
     generation: 0       // bumped to invalidate in-flight engine replies
+  };
+
+  // The online game. The host is the authority: it starts every game and
+  // settles any disagreement by sending its whole copy of the game.
+  var online = {
+    session: null,
+    role: null,         // 'host' or 'guest'
+    id: null,           // the invite ID, which is also the host's address
+    token: null,        // identifies the guest to the host
+    status: 'idle',     // transport state, see online.js
+    failure: null,      // why the session failed or ended, once it has
+    sidePref: C.WHITE,  // lobby choice: 'w', 'b' or 'random'
+    myColor: C.WHITE,
+    gameId: null,
+    started: false,     // a game has been set up with the friend
+    end: null,          // a result the board cannot show: resignation or agreed draw
+    incoming: null,     // the friend's open offer: 'draw' or 'rematch'
+    outgoing: null,     // our open offer
+    note: ''            // a passing remark, such as a declined offer
   };
 
   // --- Engine transport -------------------------------------------------
@@ -45,17 +85,22 @@
 
     init: function () {
       if (typeof Worker !== 'function' || window.location.protocol === 'file:') return;
+      this.spawn();
+    },
+
+    spawn: function () {
+      var self = this;
       try {
-        this.worker = new Worker('js/worker.js');
-        var self = this;
-        this.worker.onmessage = function (e) {
+        var worker = new Worker('js/worker.js');
+        worker.onmessage = function (e) {
           var cb = self.pending[e.data.id];
           delete self.pending[e.data.id];
           if (!cb) return;
-          if (e.data.error) { self.demote(); return; }
+          if (e.data.error) { self.demote(); cb.retry(); return; }
           cb(e.data);
         };
-        this.worker.onerror = function () { self.demote(); };
+        worker.onerror = function () { self.demote(); };
+        this.worker = worker;
       } catch (err) {
         this.worker = null;
       }
@@ -68,29 +113,37 @@
       if (this.worker) { this.worker.terminate(); this.worker = null; }
       Object.keys(stranded).forEach(function (id) {
         // Re-issue on the main thread so the game does not stall.
-        var req = stranded[id];
-        if (req && req.retry) req.retry();
+        if (stranded[id].retry) stranded[id].retry();
       });
     },
 
-    think: function (fen, level, done) {
+    // Abandons any search in flight. A worker cannot be interrupted, so a
+    // busy one is replaced; otherwise, after an undo or a new game, the next
+    // request would queue behind a stale search for its whole time budget.
+    cancel: function () {
+      if (!this.worker || !Object.keys(this.pending).length) return;
+      this.worker.terminate();
+      this.pending = {};
+      this.spawn();
+    },
+
+    think: function (req, done) {
       var id = ++this.seq;
+      var self = this;
       if (this.worker) {
-        var self = this;
         var cb = function (data) { done(data); };
-        cb.retry = function () { self.inline(fen, level, done); };
+        cb.retry = function () { self.inline(req, done); };
         this.pending[id] = cb;
-        this.worker.postMessage({ id: id, fen: fen, level: level });
+        this.worker.postMessage({ id: id, fen: req.fen, level: req.level, history: req.history });
       } else {
-        this.inline(fen, level, done);
+        this.inline(req, done);
       }
     },
 
     // Yield first so the "Thinking…" state paints before the search blocks.
-    inline: function (fen, level, done) {
+    inline: function (req, done) {
       setTimeout(function () {
-        var pos = C.parseFEN(fen);
-        var res = AI.chooseMove(pos, level);
+        var res = AI.chooseMove(C.parseFEN(req.fen), req.level, req.history);
         done(res ? {
           move: { from: res.move.from, to: res.move.to, promotion: res.move.promotion },
           score: res.score, depth: res.depth, nodes: res.nodes, timeMs: res.timeMs
@@ -99,30 +152,73 @@
     }
   };
 
-  // --- Preferences ------------------------------------------------------
+  // --- Storage ----------------------------------------------------------
+
+  // Storage can be missing or full (private windows, strict settings); the
+  // game must work regardless, so every access is wrapped.
+  function readJSON(store, key) {
+    try {
+      var raw = window[store].getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeJSON(store, key, value) {
+    try {
+      if (value === null) window[store].removeItem(key);
+      else window[store].setItem(key, JSON.stringify(value));
+    } catch (err) { /* not fatal */ }
+  }
 
   function loadPrefs() {
-    try {
-      var raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      var p = JSON.parse(raw);
-      if (p.level && AI.LEVELS[p.level]) state.level = p.level;
-      if (p.humanColor === C.WHITE || p.humanColor === C.BLACK) state.humanColor = p.humanColor;
-    } catch (err) { /* storage may be unavailable; defaults are fine */ }
+    var p = readJSON('localStorage', PREFS_KEY);
+    if (!p) return;
+    if (LEVEL_NAMES[p.level]) state.level = p.level;
+    if (p.humanColor === C.WHITE || p.humanColor === C.BLACK) state.humanColor = p.humanColor;
+    if (MODE_HINTS[p.mode]) state.mode = p.mode;
+    state.autoFlip = p.autoFlip === true;
+    if (['w', 'b', 'random'].indexOf(p.onlineSide) !== -1) online.sidePref = p.onlineSide;
   }
 
   function savePrefs() {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        level: state.level, humanColor: state.humanColor
-      }));
-    } catch (err) { /* ignore */ }
+    writeJSON('localStorage', PREFS_KEY, {
+      level: state.level,
+      humanColor: state.humanColor,
+      mode: state.mode,
+      autoFlip: state.autoFlip,
+      onlineSide: online.sidePref
+    });
   }
 
   // --- Game flow --------------------------------------------------------
 
-  function newGame() {
+  // Who chooses the move for `color`: 'human', 'engine' or 'remote'.
+  function controller(color) {
+    if (state.mode === 'local') return 'human';
+    if (state.mode === 'online') return color === online.myColor ? 'human' : 'remote';
+    return color === state.humanColor ? 'human' : 'engine';
+  }
+
+  // True while a game is actually under way on the board.
+  function gameLive() {
+    return state.mode !== 'online' || online.started;
+  }
+
+  function humanCanMove() {
+    if (state.thinking || state.result || !gameLive()) return false;
+    if (state.mode === 'online' && (online.status !== 'connected' || online.failure)) return false;
+    return controller(state.pos.turn) === 'human';
+  }
+
+  // Clears the board back to the starting position, abandoning anything in
+  // progress: engine searches, a pending promotion, a drag.
+  function resetBoard() {
     state.generation++;
+    engine.cancel();
+    hidePromotion();
+    clearDrag();
     state.pos = C.parseFEN(C.START_FEN);
     state.moves = [];
     state.keyHistory = [state.pos.key()];
@@ -131,11 +227,16 @@
     state.lastMove = null;
     state.suggestion = null;
     state.result = null;
-    state.thinking = false;
+    state.thinking = null;
     state.evalScore = 0;
-    state.orientation = state.humanColor;
+    if (el.engineLine) el.engineLine.innerHTML = '&nbsp;';
+  }
+
+  function newGame() {
+    resetBoard();
+    state.orientation = state.mode === 'computer' ? state.humanColor : C.WHITE;
     render();
-    if (state.pos.turn !== state.humanColor) requestEngineMove();
+    if (controller(state.pos.turn) === 'engine') requestEngineMove();
   }
 
   function detectResult() {
@@ -148,6 +249,7 @@
     if (pos.halfmove >= 100) return { kind: 'fifty' };
     if (C.hasInsufficientMaterial(pos)) return { kind: 'material' };
     if (repetitionCount() >= 3) return { kind: 'repetition' };
+    if (state.mode === 'online' && online.end) return online.end;
     return null;
   }
 
@@ -160,31 +262,60 @@
     return n;
   }
 
-  function applyMove(move) {
+  // Adds a move to the game record without any of the follow-up, so whole
+  // games can be replayed quickly.
+  function recordMove(move) {
     // SAN must be generated before the move is played.
     var san = C.toSAN(state.pos, move, C.legalMoves(state.pos));
     C.makeMove(state.pos, move);
-    state.moves.push({ san: san, move: move });
+    state.moves.push({ san: san, move: move, evalScore: state.evalScore });
     state.keyHistory.push(state.pos.key());
     state.lastMove = move;
+  }
+
+  // Plays `move` for the side on turn. `origin` says who chose it: 'human',
+  // 'engine' or 'remote'.
+  function applyMove(move, origin) {
+    recordMove(move);
     state.selected = -1;
     state.targets = [];
     state.suggestion = null;
     state.result = detectResult();
+
+    if (state.mode === 'local' && state.autoFlip) state.orientation = state.pos.turn;
+
+    if (state.mode === 'online') {
+      // An offer lapses once the player it was made to moves instead.
+      if (origin === 'human') {
+        if (online.incoming === 'draw') online.incoming = null;
+        sendGame({ t: 'move', ply: state.moves.length - 1, uci: C.toUCI(move) });
+      } else if (online.outgoing === 'draw') {
+        online.outgoing = null;
+      }
+      online.note = '';
+      saveOnline();
+    }
+
     render();
-    if (!state.result && state.pos.turn !== state.humanColor) requestEngineMove();
+    if (!state.result && controller(state.pos.turn) === 'engine') requestEngineMove();
+  }
+
+  // The keys of every position before the current one, so the engine can
+  // tell which moves would repeat the game.
+  function priorKeys() {
+    return state.keyHistory.slice(0, -1);
   }
 
   function requestEngineMove() {
-    state.thinking = true;
+    state.thinking = 'move';
     render();
     var gen = state.generation;
-    var fen = C.toFEN(state.pos);
+    var req = { fen: C.toFEN(state.pos), level: state.level, history: priorKeys() };
 
-    engine.think(fen, state.level, function (data) {
+    engine.think(req, function (data) {
       // A new game or an undo happened while the engine was searching.
       if (gen !== state.generation) return;
-      state.thinking = false;
+      state.thinking = null;
 
       if (!data || !data.move) { render(); return; }
 
@@ -196,44 +327,64 @@
         state.evalScore = state.pos.turn === C.WHITE ? data.score : -data.score;
       }
       showEngineLine(data);
-      applyMove(move);
+      applyMove(move, 'engine');
     });
   }
 
+  function canUndo() {
+    if (state.mode === 'local') return state.moves.length > 0;
+    if (state.mode === 'computer') {
+      // There must be a move of yours to take back; playing Black, the
+      // computer's opening move alone is not one.
+      return state.moves.length > (state.humanColor === C.WHITE ? 0 : 1);
+    }
+    return false;
+  }
+
+  function takeBack() {
+    C.unmakeMove(state.pos);
+    state.moves.pop();
+    state.keyHistory.pop();
+  }
+
   function undo() {
-    if (!state.moves.length) return;
+    if (!canUndo()) return;
     state.generation++;          // discard any search still running
-    state.thinking = false;
+    engine.cancel();
+    hidePromotion();
+    state.thinking = null;
 
-    // Step back until it is the human's turn again, so a full move pair
-    // (the computer's reply plus your own move) comes off together.
-    do {
-      C.unmakeMove(state.pos);
-      state.moves.pop();
-      state.keyHistory.pop();
-    } while (state.moves.length && state.pos.turn !== state.humanColor);
+    if (state.mode === 'local') {
+      takeBack();
+    } else {
+      // Step back until it is your turn again, so a full move pair (the
+      // computer's reply plus your own move) comes off together.
+      do { takeBack(); } while (state.moves.length && state.pos.turn !== state.humanColor);
+    }
 
-    state.lastMove = state.moves.length ? state.moves[state.moves.length - 1].move : null;
+    var last = state.moves[state.moves.length - 1];
+    state.lastMove = last ? last.move : null;
+    state.evalScore = last ? last.evalScore : 0;
     state.selected = -1;
     state.targets = [];
     state.suggestion = null;
     state.result = null;
+    if (state.mode === 'local' && state.autoFlip) state.orientation = state.pos.turn;
     el.engineLine.innerHTML = '&nbsp;';
     render();
 
-    // Undoing into a position where the engine is on move (playing Black and
-    // taking back to the very start) needs the engine to move again.
-    if (state.pos.turn !== state.humanColor) requestEngineMove();
+    if (controller(state.pos.turn) === 'engine') requestEngineMove();
   }
 
   function showHint() {
-    if (state.thinking || state.result || state.pos.turn !== state.humanColor) return;
-    state.thinking = true;
+    if (state.mode === 'online' || !humanCanMove()) return;
+    state.thinking = 'hint';
     render();
     var gen = state.generation;
-    engine.think(C.toFEN(state.pos), 'medium', function (data) {
+    var req = { fen: C.toFEN(state.pos), level: 'hint', history: priorKeys() };
+    engine.think(req, function (data) {
       if (gen !== state.generation) return;
-      state.thinking = false;
+      state.thinking = null;
       if (data && data.move) {
         state.suggestion = { from: data.move.from, to: data.move.to };
       }
@@ -241,15 +392,517 @@
     });
   }
 
-  // --- Human input ------------------------------------------------------
-
-  function humanCanMove() {
-    return !state.thinking && !state.result && state.pos.turn === state.humanColor;
+  function setMode(mode) {
+    if (mode === state.mode || !MODE_HINTS[mode]) return;
+    if (state.mode === 'online') {
+      if (onlineGameInProgress() &&
+          !window.confirm('Leave the online game? Your friend will be told you left.')) {
+        render();   // puts the mode switch back
+        return;
+      }
+      leaveOnline();
+    }
+    state.mode = mode;
+    savePrefs();
+    if (mode === 'online') {
+      enterLobby();
+    } else {
+      newGame();
+    }
   }
+
+  // --- Online play ------------------------------------------------------
+
+  function onlineGameInProgress() {
+    return !!online.session && online.started && !state.result;
+  }
+
+  function ucis() {
+    return state.moves.map(function (m) { return C.toUCI(m.move); });
+  }
+
+  function inviteLink(id) {
+    return window.location.href.split('#')[0] + '#play=' + id;
+  }
+
+  function inviteFromHash() {
+    var m = /^#play=([a-z0-9]+)$/.exec(window.location.hash);
+    return m && Online.isValidId(m[1]) ? m[1] : null;
+  }
+
+  function clearInviteHash() {
+    if (!window.location.hash) return;
+    try {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    } catch (err) {
+      window.location.hash = '';
+    }
+  }
+
+  // This browser's token for an invite. Kept in localStorage, so a friend
+  // who closes the tab and opens the link again is recognised as the same
+  // player rather than turned away as a stranger.
+  function guestToken(id) {
+    var tokens = readJSON('localStorage', TOKENS_KEY) || {};
+    if (!tokens[id]) {
+      tokens[id] = Online.randomId(16);
+      var ids = Object.keys(tokens);
+      if (ids.length > 20) delete tokens[ids[0]];   // only recent invites matter
+      writeJSON('localStorage', TOKENS_KEY, tokens);
+    }
+    return tokens[id];
+  }
+
+  // Remembers the game for this tab, so a refresh picks it up again.
+  function saveOnline() {
+    if (!online.role) return;
+    writeJSON('sessionStorage', ONLINE_KEY, {
+      role: online.role,
+      id: online.id,
+      token: online.role === 'host' ? online.token : null,
+      myColor: online.myColor,
+      gameId: online.gameId,
+      started: online.started,
+      end: online.end,
+      moves: ucis()
+    });
+  }
+
+  function loadSavedOnline() {
+    var s = readJSON('sessionStorage', ONLINE_KEY);
+    if (!s || (s.role !== 'host' && s.role !== 'guest') || !Online.isValidId(s.id)) return null;
+    if (s.myColor !== C.WHITE && s.myColor !== C.BLACK) return null;
+    if (!Array.isArray(s.moves)) return null;
+    return s;
+  }
+
+  function validEnd(end) {
+    if (!end || typeof end !== 'object') return null;
+    if (end.kind === 'agreement') return { kind: 'agreement' };
+    if (end.kind === 'resign' && (end.winner === C.WHITE || end.winner === C.BLACK)) {
+      return { kind: 'resign', winner: end.winner };
+    }
+    return null;
+  }
+
+  // Replaces the game with the one described by `moves` (UCI strings).
+  // Returns false, leaving the board at the start, if any move is illegal.
+  function loadMoves(moves) {
+    resetBoard();
+    for (var i = 0; i < moves.length; i++) {
+      var move = C.fromUCI(state.pos, moves[i]);
+      if (!move) { resetBoard(); return false; }
+      recordMove(move);
+    }
+    state.result = detectResult();
+    return true;
+  }
+
+  function resetOnline() {
+    online.session = null;
+    online.role = null;
+    online.id = null;
+    online.token = null;
+    online.status = 'idle';
+    online.failure = null;
+    online.gameId = null;
+    online.started = false;
+    online.end = null;
+    online.incoming = null;
+    online.outgoing = null;
+    online.note = '';
+  }
+
+  // Ends any online session, telling the friend, and forgets the game.
+  function leaveOnline(keepHash) {
+    if (online.session) online.session.leave();
+    resetOnline();
+    writeJSON('sessionStorage', ONLINE_KEY, null);
+    if (!keepHash) clearInviteHash();
+  }
+
+  function enterLobby() {
+    resetBoard();
+    state.orientation = online.sidePref === C.BLACK ? C.BLACK : C.WHITE;
+    render();
+  }
+
+  // Callbacks for a session. Each set is tied to its own session, so a late
+  // event from one that has since been replaced is ignored.
+  function sessionHandlers() {
+    var handlers = {
+      owner: null,
+      state: function (name, info) {
+        if (handlers.owner && online.session !== handlers.owner) return;
+        onSessionState(name, info);
+      },
+      connect: function () {
+        if (handlers.owner && online.session !== handlers.owner) return;
+        onSessionConnect();
+      },
+      message: function (msg) {
+        if (handlers.owner && online.session !== handlers.owner) return;
+        onSessionMessage(msg);
+      },
+      token: function (token) {
+        if (handlers.owner && online.session !== handlers.owner) return;
+        online.token = token;
+        saveOnline();
+      }
+    };
+    return handlers;
+  }
+
+  function startSession(kind, opts) {
+    var handlers = sessionHandlers();
+    online.session = Online[kind](opts, handlers);
+    handlers.owner = online.session;
+    return online.session;
+  }
+
+  function createInvite() {
+    leaveOnline();
+    online.role = 'host';
+    online.myColor = online.sidePref === 'random'
+      ? (Math.random() < 0.5 ? C.WHITE : C.BLACK)
+      : online.sidePref;
+    resetBoard();
+    state.orientation = online.myColor;
+    online.id = startSession('host', {}).id;
+    saveOnline();
+    render();
+  }
+
+  // Picks up a game this tab was hosting before a refresh.
+  function resumeHost(saved) {
+    resetOnline();
+    online.role = 'host';
+    online.id = saved.id;
+    online.token = saved.token || null;
+    online.myColor = saved.myColor;
+    online.gameId = saved.gameId || null;
+    online.started = !!saved.started && !!saved.gameId;
+    online.end = validEnd(saved.end);
+    if (!loadMoves(saved.moves)) online.started = false;
+    state.orientation = online.myColor;
+    startSession('host', { id: saved.id, token: online.token });
+  }
+
+  function joinInvite(id, saved) {
+    resetOnline();
+    online.role = 'guest';
+    online.id = id;
+    online.token = guestToken(id);
+    resetBoard();
+    if (saved && saved.gameId) {
+      // Show the game as it stood; the host confirms it once connected.
+      online.myColor = saved.myColor;
+      online.gameId = saved.gameId;
+      online.end = validEnd(saved.end);
+      online.started = loadMoves(saved.moves);
+    }
+    state.orientation = online.myColor;
+    startSession('join', { id: id, token: online.token });
+    saveOnline();
+  }
+
+  function retryOnline() {
+    if (online.role === 'guest' && online.id) {
+      var id = online.id;
+      joinInvite(id, loadSavedOnline());
+    } else {
+      createInvite();
+    }
+    render();
+  }
+
+  function onSessionState(name, info) {
+    online.status = name;
+    if (name === 'failed' || name === 'ended') {
+      online.failure = name === 'ended' ? 'left' : info.reason;
+      online.session = null;
+      online.incoming = null;
+      online.outgoing = null;
+      hidePromotion();
+      writeJSON('sessionStorage', ONLINE_KEY, null);
+    }
+    render();
+  }
+
+  function onSessionConnect() {
+    // The guest reports what it has; the host answers with the game.
+    if (online.role === 'guest') sendGame({ t: 'join', moves: ucis() });
+  }
+
+  function sendGame(msg) {
+    if (!online.session) return false;
+    msg.gameId = online.gameId;
+    return online.session.send(msg);
+  }
+
+  function sendState() {
+    sendGame({
+      t: 'state',
+      you: C.opponent(online.myColor),
+      moves: ucis(),
+      end: online.end
+    });
+  }
+
+  function onSessionMessage(msg) {
+    if (msg.t === 'join') { if (online.role === 'host') onJoin(msg); return; }
+    if (msg.t === 'state') { if (online.role === 'guest') onState(msg); return; }
+    // Everything else concerns one particular game.
+    if (!online.started || msg.gameId !== online.gameId) return;
+    if (msg.t === 'move') onRemoteMove(msg);
+    else if (msg.t === 'resign') onRemoteResign();
+    else if (msg.t === 'draw') onRemoteDraw(msg.action);
+    else if (msg.t === 'rematch') onRemoteRematch(msg.action);
+  }
+
+  // Host: the friend has (re)connected and said which moves it has seen.
+  function onJoin(msg) {
+    if (!online.started) {
+      startOnlineGame(online.myColor);
+      return;
+    }
+    // The friend may hold one move of its own that never reached us,
+    // played just as the connection dropped. Accept it if it fits.
+    var theirs = Array.isArray(msg.moves) ? msg.moves : [];
+    var ours = ucis();
+    if (msg.gameId === online.gameId && !state.result &&
+        theirs.length === ours.length + 1 &&
+        controller(state.pos.turn) === 'remote' &&
+        ours.every(function (u, i) { return theirs[i] === u; })) {
+      var move = C.fromUCI(state.pos, theirs[theirs.length - 1]);
+      if (move) applyMove(move, 'remote');
+    }
+    sendState();
+  }
+
+  // Guest: the host's copy of the game, which replaces ours.
+  function onState(msg) {
+    if (typeof msg.gameId !== 'string' || !Array.isArray(msg.moves)) return;
+    if (msg.you !== C.WHITE && msg.you !== C.BLACK) return;
+    var isNewGame = msg.gameId !== online.gameId;
+    online.gameId = msg.gameId;
+    online.myColor = msg.you;
+    online.end = validEnd(msg.end);
+    online.started = true;
+    online.incoming = null;
+    online.outgoing = null;
+    online.note = '';
+    var orientation = state.orientation;
+    loadMoves(msg.moves);
+    // A new game faces you; a resynchronised one keeps any flip you made.
+    state.orientation = isNewGame ? online.myColor : orientation;
+    saveOnline();
+    render();
+  }
+
+  // Host: a fresh game, sent to the friend.
+  function startOnlineGame(hostColor) {
+    resetBoard();
+    online.gameId = Online.randomId(8);
+    online.myColor = hostColor;
+    online.started = true;
+    online.end = null;
+    online.incoming = null;
+    online.outgoing = null;
+    online.note = '';
+    state.orientation = hostColor;
+    saveOnline();
+    sendState();
+    render();
+  }
+
+  // When the two copies of the game disagree, the host's copy wins.
+  function resync() {
+    if (online.role === 'host') sendState();
+    else sendGame({ t: 'join', moves: ucis() });
+  }
+
+  function onRemoteMove(msg) {
+    var fits = !state.result && msg.ply === state.moves.length &&
+      controller(state.pos.turn) === 'remote';
+    var move = fits ? C.fromUCI(state.pos, msg.uci) : null;
+    if (!move) { resync(); return; }
+    applyMove(move, 'remote');
+  }
+
+  // Ends the online game with a result the board cannot show for itself.
+  function concludeOnline(end) {
+    online.end = end;
+    online.incoming = null;
+    online.outgoing = null;
+    online.note = '';
+    hidePromotion();
+    state.selected = -1;
+    state.targets = [];
+    state.result = detectResult();
+    saveOnline();
+    render();
+  }
+
+  function onRemoteResign() {
+    if (state.result) return;
+    concludeOnline({ kind: 'resign', winner: online.myColor });
+  }
+
+  function onRemoteDraw(action) {
+    if (state.result) return;
+    if (action === 'offer') {
+      if (online.outgoing === 'draw') {
+        // Both offered at once: that is an agreement.
+        sendGame({ t: 'draw', action: 'accept' });
+        concludeOnline({ kind: 'agreement' });
+        return;
+      }
+      online.incoming = 'draw';
+      online.note = '';
+    } else if (action === 'accept' && online.outgoing === 'draw') {
+      concludeOnline({ kind: 'agreement' });
+      return;
+    } else if (action === 'decline' && online.outgoing === 'draw') {
+      online.outgoing = null;
+      online.note = 'Your friend declined the draw.';
+    }
+    render();
+  }
+
+  function onRemoteRematch(action) {
+    if (!state.result) return;
+    if (action === 'offer') {
+      if (online.outgoing === 'rematch') {
+        acceptRematch();
+        return;
+      }
+      online.incoming = 'rematch';
+      online.note = '';
+    } else if (action === 'accept' && online.outgoing === 'rematch') {
+      // Only the host starts games; the guest waits for the new state.
+      if (online.role === 'host') startOnlineGame(C.opponent(online.myColor));
+      return;
+    } else if (action === 'decline' && online.outgoing === 'rematch') {
+      online.outgoing = null;
+      online.note = 'Your friend declined a rematch.';
+    }
+    render();
+  }
+
+  function acceptRematch() {
+    online.incoming = null;
+    if (online.role === 'host') {
+      startOnlineGame(C.opponent(online.myColor));   // colours swap each game
+    } else {
+      sendGame({ t: 'rematch', action: 'accept' });
+      online.note = 'Starting the rematch…';
+      render();
+    }
+  }
+
+  function canActOnline() {
+    return state.mode === 'online' && online.started && !online.failure &&
+      online.status === 'connected';
+  }
+
+  function resign() {
+    if (!canActOnline() || state.result) return;
+    if (!window.confirm('Resign this game?')) return;
+    sendGame({ t: 'resign' });
+    concludeOnline({ kind: 'resign', winner: C.opponent(online.myColor) });
+  }
+
+  function offerDraw() {
+    if (!canActOnline() || state.result || online.outgoing === 'draw') return;
+    if (online.incoming === 'draw') { acceptOffer(); return; }
+    online.outgoing = 'draw';
+    online.note = '';
+    sendGame({ t: 'draw', action: 'offer' });
+    render();
+  }
+
+  function offerRematch() {
+    if (!canActOnline() || !state.result || online.outgoing === 'rematch') return;
+    if (online.incoming === 'rematch') { acceptRematch(); return; }
+    online.outgoing = 'rematch';
+    online.note = '';
+    sendGame({ t: 'rematch', action: 'offer' });
+    render();
+  }
+
+  function acceptOffer() {
+    if (!canActOnline()) return;
+    if (online.incoming === 'draw' && !state.result) {
+      sendGame({ t: 'draw', action: 'accept' });
+      concludeOnline({ kind: 'agreement' });
+    } else if (online.incoming === 'rematch' && state.result) {
+      acceptRematch();
+    }
+  }
+
+  function declineOffer() {
+    var kind = online.incoming;
+    if (!kind) return;
+    online.incoming = null;
+    sendGame({ t: kind, action: 'decline' });
+    render();
+  }
+
+  function leaveButton() {
+    if (onlineGameInProgress() && !online.failure &&
+        !window.confirm('Leave this game? Your friend will be told you left.')) return;
+    leaveOnline();
+    enterLobby();
+  }
+
+  function copyInvite() {
+    var link = el.inviteLink.value;
+    var done = function () {
+      el.btnCopy.textContent = 'Copied!';
+      setTimeout(function () { el.btnCopy.textContent = 'Copy'; }, 1600);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(link).then(done, function () { selectInvite(); });
+    } else {
+      selectInvite();
+      try { if (document.execCommand('copy')) done(); } catch (err) { /* selected for manual copy */ }
+    }
+  }
+
+  function selectInvite() {
+    el.inviteLink.focus();
+    el.inviteLink.select();
+  }
+
+  function shareInvite() {
+    if (!navigator.share) return;
+    navigator.share({
+      title: 'Play chess with me',
+      text: 'Join my chess game:',
+      url: el.inviteLink.value
+    }).catch(function () { /* dismissed */ });
+  }
+
+  // Opening an invite link while the page is already open only changes the
+  // hash, which does not reload the page.
+  function onHashChange() {
+    var id = inviteFromHash();
+    if (!id || (online.session && online.id === id)) return;
+    if (onlineGameInProgress() &&
+        !window.confirm('Leave your current game to join this one?')) return;
+    leaveOnline(true);
+    state.mode = 'online';
+    savePrefs();
+    joinInvite(id, null);
+    render();
+  }
+
+  // --- Human input ------------------------------------------------------
 
   function selectSquare(index) {
     var piece = state.pos.board[index];
-    if (piece === null || C.colorOf(piece) !== state.humanColor) {
+    if (piece === null || C.colorOf(piece) !== state.pos.turn) {
       state.selected = -1;
       state.targets = [];
       return;
@@ -260,6 +913,9 @@
 
   // Returns true when the click/drop consumed the interaction.
   function attemptMove(from, to) {
+    // The game can change under a pending click or drag: the friend may
+    // resign, or the host may resend the game.
+    if (!humanCanMove()) return false;
     var candidates = state.targets.filter(function (m) {
       return m.from === from && m.to === to;
     });
@@ -269,7 +925,7 @@
       askPromotion(candidates);
       return true;
     }
-    applyMove(candidates[0]);
+    applyMove(candidates[0], 'human');
     return true;
   }
 
@@ -277,6 +933,7 @@
     el.promotionChoices.innerHTML = '';
     // Present them queen-first, which is what players want nearly always.
     var order = ['q', 'r', 'b', 'n'];
+    var gen = state.generation;
     order.forEach(function (t) {
       var move = candidates.filter(function (m) {
         return C.typeOf(m.promotion) === t;
@@ -286,14 +943,24 @@
       btn.type = 'button';
       btn.className = 'promo-btn';
       btn.title = { q: 'Queen', r: 'Rook', b: 'Bishop', n: 'Knight' }[t];
+      btn.setAttribute('aria-label', btn.title);
       btn.appendChild(pieceSpan(move.promotion));
       btn.addEventListener('click', function () {
-        el.promotionModal.hidden = true;
-        applyMove(move);
+        hidePromotion();
+        if (gen === state.generation && humanCanMove()) applyMove(move, 'human');
+        else render();
       });
       el.promotionChoices.appendChild(btn);
     });
     el.promotionModal.hidden = false;
+    var first = el.promotionChoices.querySelector('button');
+    if (first) first.focus();
+  }
+
+  function hidePromotion() {
+    if (!el.promotionModal) return;
+    el.promotionModal.hidden = true;
+    el.promotionChoices.innerHTML = '';
   }
 
   // --- Rendering --------------------------------------------------------
@@ -310,12 +977,24 @@
   }
 
   function render() {
+    renderMode();
     renderBoard();
     renderStatus();
     renderMoves();
-    renderCaptured();
+    renderPlayers();
     renderEvalBar();
     renderControls();
+    renderOnline();
+  }
+
+  function renderMode() {
+    var nodes = document.querySelectorAll('[data-modes]');
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].hidden = nodes[i].getAttribute('data-modes').split(' ').indexOf(state.mode) === -1;
+    }
+    el.modeInputs.forEach(function (input) { input.checked = input.value === state.mode; });
+    el.modeHint.textContent = MODE_HINTS[state.mode];
+    el.evalbar.hidden = state.mode !== 'computer';
   }
 
   function renderBoard() {
@@ -323,6 +1002,7 @@
     var frag = document.createDocumentFragment();
     var checkedKing = -1;
     if (C.inCheck(pos, pos.turn)) checkedKing = pos.kings[pos.turn];
+    var canMove = humanCanMove();
 
     for (var visual = 0; visual < 64; visual++) {
       var index = boardIndexAt(visual);
@@ -355,7 +1035,7 @@
         hint.className = target.captured !== null ? 'hint-ring' : 'hint-dot';
         square.appendChild(hint);
         square.classList.add('square--playable');
-      } else if (piece !== null && C.colorOf(piece) === state.humanColor && humanCanMove()) {
+      } else if (piece !== null && C.colorOf(piece) === pos.turn && canMove) {
         square.classList.add('square--playable');
       }
 
@@ -378,36 +1058,117 @@
 
     el.board.innerHTML = '';
     el.board.appendChild(frag);
-    el.boardVeil.hidden = humanCanMove();
+    el.boardVeil.hidden = canMove;
+    el.boardVeil.classList.toggle('board-veil--busy', !!state.thinking);
+  }
+
+  function sideName(color) {
+    return color === C.WHITE ? 'White' : 'Black';
+  }
+
+  function winsText(color) {
+    if (state.mode === 'local') return sideName(color) + ' wins.';
+    if (state.mode === 'online') return color === online.myColor ? 'you win!' : 'your friend wins.';
+    return color === state.humanColor ? 'you win!' : 'the computer wins.';
+  }
+
+  function resultText(r) {
+    switch (r.kind) {
+      case 'checkmate':
+        return 'Checkmate — ' + winsText(r.winner);
+      case 'resign':
+        if (state.mode === 'online') {
+          return r.winner === online.myColor ? 'Your friend resigned — you win!' : 'You resigned.';
+        }
+        return sideName(C.opponent(r.winner)) + ' resigned — ' + winsText(r.winner);
+      case 'agreement':
+        return 'Draw agreed.';
+      case 'stalemate':
+        return 'Stalemate — draw.';
+      case 'fifty':
+        return 'Draw by the fifty-move rule.';
+      case 'material':
+        return 'Draw — insufficient material.';
+      default:
+        return 'Draw by threefold repetition.';
+    }
+  }
+
+  function failureText(reason) {
+    switch (reason) {
+      case 'left':
+        return 'Your friend left the game.';
+      case 'unsupported':
+        return 'This browser cannot play online. Try a current Chrome, Firefox, Safari or Edge.';
+      case 'unavailable':
+        return 'Could not reach the matchmaking server. Check your connection and try again.';
+      case 'not-found':
+        return online.started
+          ? 'Lost touch with your friend.'
+          : 'Could not find that game. The link may be old, or your friend closed the page.';
+      case 'full':
+        return 'That game already has two players.';
+      case 'taken':
+        return 'Could not reopen your game. Create a new invite.';
+      case 'elsewhere':
+        return 'This game was opened in another tab or window.';
+      default:
+        return 'The connection failed.';
+    }
+  }
+
+  function lobbyText() {
+    switch (online.status) {
+      case 'starting':
+        return online.role === 'host' ? 'Creating your game…' : 'Connecting to your friend…';
+      case 'waiting':
+        return 'Waiting for your friend to open the link…';
+      case 'connecting':
+      case 'connected':
+        return 'Connecting to your friend…';
+      case 'lost':
+        return online.role === 'host'
+          ? 'Waiting for your friend to open the link…'
+          : 'Connecting to your friend…';
+      default:
+        return 'Invite a friend to a game.';
+    }
+  }
+
+  function turnText() {
+    var yours = controller(state.pos.turn) === 'human';
+    if (state.mode === 'local') return sideName(state.pos.turn) + ' to move';
+    if (state.mode === 'online') return yours ? 'Your move' : 'Your friend’s move';
+    return yours ? 'Your move' : 'Computer to move';
   }
 
   function renderStatus() {
     var cls = 'status';
     var text;
+    var isOnline = state.mode === 'online';
 
-    if (state.result) {
+    if (isOnline && online.failure) {
       cls += ' status--over';
-      var r = state.result;
-      if (r.kind === 'checkmate') {
-        var youWon = r.winner === state.humanColor;
-        text = 'Checkmate — ' + (youWon ? 'you win!' : 'the computer wins.');
-      } else if (r.kind === 'stalemate') {
-        text = 'Stalemate — draw.';
-      } else if (r.kind === 'fifty') {
-        text = 'Draw by the fifty-move rule.';
-      } else if (r.kind === 'material') {
-        text = 'Draw — insufficient material.';
-      } else {
-        text = 'Draw by threefold repetition.';
-      }
+      text = failureText(online.failure);
+      if (state.result) text = resultText(state.result) + ' ' + text;
+    } else if (state.result) {
+      cls += ' status--over';
+      text = resultText(state.result);
+    } else if (isOnline && !online.started) {
+      cls += online.session ? ' status--thinking' : '';
+      text = lobbyText();
+    } else if (isOnline && online.status !== 'connected') {
+      cls += ' status--thinking';
+      text = online.role === 'host'
+        ? 'Your friend lost connection — waiting for them to come back…'
+        : 'Connection lost — reconnecting…';
     } else if (state.thinking) {
       cls += ' status--thinking';
-      text = 'Computer is thinking…';
+      text = state.thinking === 'hint' ? 'Looking for a good move…' : 'Computer is thinking…';
     } else {
       var checked = C.inCheck(state.pos, state.pos.turn);
       if (checked) cls += ' status--check';
-      var yours = state.pos.turn === state.humanColor;
-      text = (yours ? 'Your move' : 'Computer to move') + (checked ? ' — check!' : '.');
+      text = turnText() + (checked ? ' — check!' : '.');
     }
 
     el.status.className = cls;
@@ -416,6 +1177,7 @@
 
   function showEngineLine(data) {
     if (typeof data.depth !== 'number') { el.engineLine.innerHTML = '&nbsp;'; return; }
+    if (data.depth === 0) { el.engineLine.textContent = 'only one legal move'; return; }
     // Both readouts are from White's point of view, so a leading + always
     // means White is better, mate scores included.
     var score = state.evalScore;
@@ -442,8 +1204,8 @@
       return;
     }
 
-    // The first ply is Black's whenever the game began mid-move; with a
-    // standard start it is always White's.
+    // Games always begin from the standard position, so the first ply of
+    // each row is White's.
     for (var i = 0; i < state.moves.length; i += 2) {
       var row = document.createElement('li');
       row.className = 'moves__row';
@@ -465,40 +1227,49 @@
     el.moveList.scrollTop = el.moveList.scrollHeight;
   }
 
-  function renderCaptured() {
-    var alive = { w: {}, b: {} };
-    'pnbrqk'.split('').forEach(function (t) { alive.w[t] = 0; alive.b[t] = 0; });
-    for (var i = 0; i < 64; i++) {
-      var p = state.pos.board[i];
-      if (p !== null) alive[C.colorOf(p)][C.typeOf(p)]++;
-    }
+  function playerName(color) {
+    if (state.mode === 'local') return sideName(color);
+    if (state.mode === 'online') return color === online.myColor ? 'You' : 'Friend';
+    return color === state.humanColor ? 'You' : 'Computer · ' + LEVEL_NAMES[state.level];
+  }
 
+  function renderPlayers() {
+    // Captures come from the game record rather than from counting what is
+    // left on the board, which would mistake a promoted pawn for a lost one.
     var lost = { w: [], b: [] };
-    var onBoardValue = { w: 0, b: 0 };
+    state.moves.forEach(function (entry) {
+      var cap = entry.move.captured;
+      if (cap) lost[C.colorOf(cap)].push(cap);
+    });
     ['w', 'b'].forEach(function (color) {
-      'qrbnp'.split('').forEach(function (t) {
-        onBoardValue[color] += alive[color][t] * PIECE_VALUE[t];
-        // A promotion can leave more of a piece alive than the army started
-        // with; the loop simply does not run when `missing` is negative.
-        var missing = FULL_ARMY[t] - alive[color][t];
-        for (var k = 0; k < missing; k++) {
-          lost[color].push(color === 'w' ? t.toUpperCase() : t);
-        }
+      lost[color].sort(function (a, b) {
+        return CAPTURE_ORDER.indexOf(C.typeOf(a)) - CAPTURE_ORDER.indexOf(C.typeOf(b));
       });
     });
 
-    // Scoring from what is still on the board rather than from what was
-    // captured keeps the count right after a promotion.
+    // The material edge, though, is what is on the board now.
+    var material = { w: 0, b: 0 };
+    for (var i = 0; i < 64; i++) {
+      var p = state.pos.board[i];
+      if (p !== null) material[C.colorOf(p)] += PIECE_VALUE[C.typeOf(p)];
+    }
+
     var bottom = state.orientation;
     var top = C.opponent(bottom);
-    var edge = onBoardValue[bottom] - onBoardValue[top];
-    fillCaptured(el.capturedBottom, lost[top], edge);
-    fillCaptured(el.capturedTop, lost[bottom], -edge);
+    var edge = material[bottom] - material[top];
+    fillPlayer('Bottom', bottom, lost[top], edge);
+    fillPlayer('Top', top, lost[bottom], -edge);
   }
 
-  function fillCaptured(container, pieces, advantage) {
+  function fillPlayer(where, color, captured, advantage) {
+    el['name' + where].textContent = playerName(color);
+    el['swatch' + where].className = 'player__swatch player__swatch--' + color;
+    el['player' + where].classList.toggle('player--turn',
+      !state.result && gameLive() && state.pos.turn === color);
+
+    var container = el['captured' + where];
     container.innerHTML = '';
-    pieces.forEach(function (p) { container.appendChild(pieceSpan(p)); });
+    captured.forEach(function (p) { container.appendChild(pieceSpan(p)); });
     if (advantage > 0) {
       var badge = document.createElement('span');
       badge.className = 'captured__edge';
@@ -522,10 +1293,71 @@
   }
 
   function renderControls() {
-    el.btnUndo.disabled = state.moves.length === 0;
+    el.btnUndo.disabled = !canUndo();
     el.btnHint.disabled = !humanCanMove();
     el.selLevel.value = state.level;
     el.selSide.value = state.humanColor;
+    el.chkAutoFlip.checked = state.autoFlip;
+    el.selOnlineSide.value = online.sidePref;
+
+    if (state.mode !== 'online') {
+      el.controls.hidden = false;
+      return;
+    }
+
+    // Online: the game controls appear once there is a game.
+    el.controls.hidden = !online.started;
+    var over = !!state.result;
+    var active = canActOnline();
+    el.btnDraw.hidden = over || !!online.failure;
+    el.btnResign.hidden = over || !!online.failure;
+    el.btnRematch.hidden = !over || !!online.failure;
+    el.btnDraw.disabled = !active || online.outgoing === 'draw';
+    el.btnDraw.textContent = online.outgoing === 'draw' ? 'Draw offered' : 'Offer draw';
+    el.btnResign.disabled = !active;
+    el.btnRematch.disabled = !active || online.outgoing === 'rematch';
+    el.btnRematch.textContent = online.outgoing === 'rematch' ? 'Rematch offered' : 'Rematch';
+    el.btnLeave.textContent = online.failure ? 'New invite' : 'Leave';
+  }
+
+  function renderOnline() {
+    var on = state.mode === 'online';
+    el.lobby.hidden = !on || online.started;
+
+    if (on && !online.started) {
+      var hosting = online.role === 'host' && !!online.session;
+      el.lobbyStart.hidden = !!online.session || !!online.failure;
+      el.invitePanel.hidden = !hosting;
+      if (hosting && el.inviteLink.value !== inviteLink(online.id)) {
+        el.inviteLink.value = inviteLink(online.id);
+      }
+      el.btnShare.hidden = !navigator.share;
+      el.lobbyRetry.hidden = !online.failure;
+      // Some failures cannot be fixed by trying the same thing again.
+      el.btnRetry.hidden = online.failure === 'full' || online.failure === 'elsewhere' ||
+        online.failure === 'unsupported';
+      el.btnRetry.textContent = online.role === 'guest' ? 'Try again' : 'Create a new invite';
+      el.btnBackToLobby.hidden = online.role !== 'guest';
+    }
+
+    var text = '';
+    var actions = false;
+    if (on && online.started && !online.failure) {
+      if (online.incoming === 'draw' && !state.result) {
+        text = 'Your friend offers a draw.';
+        actions = true;
+      } else if (online.incoming === 'rematch' && state.result) {
+        text = 'Your friend wants a rematch. You would swap colours.';
+        actions = true;
+      } else if (online.outgoing === 'rematch' && state.result) {
+        text = 'Rematch offered. Waiting for your friend…';
+      } else if (online.note) {
+        text = online.note;
+      }
+    }
+    el.offer.hidden = !text;
+    el.offerText.textContent = text;
+    el.offerActions.hidden = !actions;
   }
 
   // --- Pointer handling (click-to-move and drag-and-drop) ---------------
@@ -549,7 +1381,7 @@
     if (state.selected !== -1 && attemptMove(state.selected, index)) return;
 
     var piece = state.pos.board[index];
-    if (piece === null || C.colorOf(piece) !== state.humanColor) {
+    if (piece === null || C.colorOf(piece) !== state.pos.turn) {
       state.selected = -1;
       state.targets = [];
       render();
@@ -614,11 +1446,11 @@
 
   function clearDrag() {
     if (drag.ghost && drag.ghost.parentNode) drag.ghost.parentNode.removeChild(drag.ghost);
-    el.dragLayer.hidden = true;
+    if (el.dragLayer) el.dragLayer.hidden = true;
     drag.active = false;
     drag.moved = false;
     drag.ghost = null;
-    var dragging = el.board.querySelector('.square--dragging');
+    var dragging = el.board ? el.board.querySelector('.square--dragging') : null;
     if (dragging) dragging.classList.remove('square--dragging');
   }
 
@@ -627,13 +1459,25 @@
   function init() {
     [
       'board', 'boardVeil', 'status', 'statusText', 'engineLine', 'moveList',
+      'playerTop', 'playerBottom', 'nameTop', 'nameBottom', 'swatchTop', 'swatchBottom',
       'capturedTop', 'capturedBottom', 'evalbar', 'evalbarFill', 'dragLayer',
-      'promotionModal', 'promotionChoices', 'btnNew', 'btnUndo', 'btnHint',
-      'btnFlip', 'selLevel', 'selSide'
+      'promotionModal', 'promotionChoices', 'controls', 'btnNew', 'btnUndo', 'btnHint',
+      'btnFlip', 'btnDraw', 'btnResign', 'btnRematch', 'btnLeave', 'selLevel', 'selSide',
+      'chkAutoFlip', 'modeHint', 'lobby', 'lobbyStart', 'selOnlineSide', 'btnInvite',
+      'invitePanel', 'inviteLink', 'btnCopy', 'btnShare', 'btnCancelInvite', 'lobbyRetry',
+      'btnRetry', 'btnBackToLobby', 'offer', 'offerText', 'offerActions', 'btnAccept',
+      'btnDecline'
     ].forEach(function (id) { el[id] = document.getElementById(id); });
+    el.modeInputs = Array.prototype.slice.call(document.querySelectorAll('input[name="mode"]'));
 
     loadPrefs();
     engine.init();
+
+    el.modeInputs.forEach(function (input) {
+      input.addEventListener('change', function () {
+        if (input.checked) setMode(input.value);
+      });
+    });
 
     el.btnNew.addEventListener('click', newGame);
     el.btnUndo.addEventListener('click', undo);
@@ -654,23 +1498,86 @@
       savePrefs();
       newGame();
     });
+    el.chkAutoFlip.addEventListener('change', function () {
+      state.autoFlip = el.chkAutoFlip.checked;
+      savePrefs();
+      if (state.autoFlip) state.orientation = state.pos.turn;
+      render();
+    });
+
+    el.selOnlineSide.addEventListener('change', function () {
+      online.sidePref = el.selOnlineSide.value;
+      savePrefs();
+      if (!online.session) {
+        state.orientation = online.sidePref === C.BLACK ? C.BLACK : C.WHITE;
+        render();
+      }
+    });
+    el.btnInvite.addEventListener('click', createInvite);
+    el.btnCopy.addEventListener('click', copyInvite);
+    el.btnShare.addEventListener('click', shareInvite);
+    el.inviteLink.addEventListener('focus', selectInvite);
+    el.btnCancelInvite.addEventListener('click', function () { leaveOnline(); enterLobby(); });
+    el.btnRetry.addEventListener('click', retryOnline);
+    el.btnBackToLobby.addEventListener('click', function () { leaveOnline(); enterLobby(); });
+    el.btnDraw.addEventListener('click', offerDraw);
+    el.btnResign.addEventListener('click', resign);
+    el.btnRematch.addEventListener('click', offerRematch);
+    el.btnLeave.addEventListener('click', leaveButton);
+    el.btnAccept.addEventListener('click', acceptOffer);
+    el.btnDecline.addEventListener('click', declineOffer);
 
     el.board.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', clearDrag);
 
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape') {
-        if (!el.promotionModal.hidden) return;   // the dialog must be answered
-        state.selected = -1;
-        state.targets = [];
-        state.suggestion = null;
-        render();
-      }
+    // Clicking outside the promotion choices backs out of the move.
+    el.promotionModal.addEventListener('click', function (e) {
+      if (e.target === el.promotionModal) { hidePromotion(); render(); }
     });
 
-    newGame();
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (!el.promotionModal.hidden) { hidePromotion(); render(); return; }
+      state.selected = -1;
+      state.targets = [];
+      state.suggestion = null;
+      render();
+    });
+
+    window.addEventListener('hashchange', onHashChange);
+    // Release the broker registration promptly, so a refreshed host can
+    // claim its invite ID again without waiting for it to time out.
+    window.addEventListener('pagehide', function (e) {
+      if (online.session && !e.persisted) online.session.close();
+    });
+
+    startUp();
+  }
+
+  // Decides what the page opens on: an invite link, a game this tab was
+  // already playing online, or the last mode used.
+  function startUp() {
+    var invite = inviteFromHash();
+    var saved = loadSavedOnline();
+
+    if (invite) {
+      state.mode = 'online';
+      savePrefs();
+      if (saved && saved.role === 'host' && saved.id === invite) resumeHost(saved);
+      else joinInvite(invite, saved && saved.role === 'guest' && saved.id === invite ? saved : null);
+      render();
+    } else if (saved && saved.role === 'host') {
+      state.mode = 'online';
+      resumeHost(saved);
+      render();
+    } else if (state.mode === 'online') {
+      writeJSON('sessionStorage', ONLINE_KEY, null);
+      enterLobby();
+    } else {
+      newGame();
+    }
   }
 
   if (document.readyState === 'loading') {

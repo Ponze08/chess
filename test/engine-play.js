@@ -19,6 +19,13 @@ function check(name, ok, detail) {
 
 function san(pos, move) { return C.toSAN(pos, move, C.legalMoves(pos)); }
 
+// Plays UCI moves and returns the key of every position along the way.
+function playUCI(pos, ucis) {
+  var keys = [pos.key()];
+  ucis.forEach(function (u) { C.makeMove(pos, C.fromUCI(pos, u)); keys.push(pos.key()); });
+  return keys;
+}
+
 // Guards the test data itself: a position where the side that just moved is
 // still in check could never arise in a real game.
 function legalPosition(pos) { return !C.inCheck(pos, C.opponent(pos.turn)); }
@@ -76,6 +83,52 @@ function forcedMateIn(pos, n) {
     'played ' + san(pos, result.move) + ', score ' + result.score);
 })();
 
+// Mates that end at the search horizon: the mated side has no moves, but
+// the search used to stop there and evaluate the position as if it were
+// ordinary. Each of these is a forced mate in exactly three.
+[
+  '8/8/3R4/8/3K4/8/8/3k4 w - - 0 1',
+  '8/3k4/1Q6/4K3/8/8/8/8 w - - 0 1',
+  '3k4/8/8/4K3/8/8/8/4R3 w - - 0 1'
+].forEach(function (fen) {
+  var pos = C.parseFEN(fen);
+  var exact = forcedMateIn(pos, 3) === 3 && forcedMateIn(pos, 2) === 0;
+  var result = AI.chooseMove(pos, 'hard');
+  var reported = Math.abs(result.score) > AI.MATE - 100
+    ? Math.ceil((AI.MATE - Math.abs(result.score)) / 2) : 0;
+  check('hard finds a mate in 3 and reports its length', exact && reported === 3,
+    fen + '  engine says mate in ' + reported + ' (depth ' + result.depth + ')');
+});
+
+// Repetitions with the game so far. White is a queen down and has just
+// shuffled Kg1-h1-g1 while Black shuffled Kb8-a8-b8.
+(function () {
+  var fen = '1k6/8/8/q7/8/8/5PPP/6K1 w - - 0 1';
+  var cycle = ['g1h1', 'b8a8', 'h1g1', 'a8b8'];
+
+  // After one cycle, Kh1 would only repeat the position a second time:
+  // no draw, and Black mates with Qe1.
+  var pos = C.parseFEN(fen);
+  var keys = playUCI(pos, cycle);
+  var result = AI.chooseMove(pos, 'hard', keys.slice(0, -1));
+  check('a second occurrence is not mistaken for a draw', C.toUCI(result.move) !== 'g1h1',
+    'played ' + san(pos, result.move) + ', score ' + result.score);
+
+  // After two cycles Kh1 makes it three: the losing side takes the draw.
+  pos = C.parseFEN(fen);
+  keys = playUCI(pos, cycle.concat(cycle));
+  result = AI.chooseMove(pos, 'hard', keys.slice(0, -1));
+  check('the losing side claims a threefold repetition',
+    C.toUCI(result.move) === 'g1h1' && result.score === 0,
+    'played ' + san(pos, result.move) + ', score ' + result.score);
+})();
+
+(function () {
+  var result = AI.chooseMove(C.parseFEN('7k/8/8/8/8/8/1q6/K7 w - - 0 1'), 'hard');
+  check('a forced move is played without inventing a score',
+    result && C.toUCI(result.move) === 'a1b2' && result.score === null);
+})();
+
 ['easy', 'medium', 'hard', 'expert'].forEach(function (level) {
   var pos = C.parseFEN(C.START_FEN);
   var started = Date.now();
@@ -92,6 +145,7 @@ function forcedMateIn(pos, n) {
 function playGame(whiteLevel, blackLevel) {
   var pos = C.parseFEN(C.START_FEN);
   var seen = {};
+  var history = [];   // keys of earlier positions, as the UI passes them
   for (var ply = 0; ply < 260; ply++) {
     if (C.legalMoves(pos).length === 0) {
       return C.inCheck(pos, pos.turn) ? C.opponent(pos.turn) : 'draw';
@@ -100,7 +154,9 @@ function playGame(whiteLevel, blackLevel) {
     var key = pos.key();
     seen[key] = (seen[key] || 0) + 1;
     if (seen[key] >= 3) return 'draw';
-    C.makeMove(pos, AI.chooseMove(pos, pos.turn === C.WHITE ? whiteLevel : blackLevel).move);
+    var level = pos.turn === C.WHITE ? whiteLevel : blackLevel;
+    C.makeMove(pos, AI.chooseMove(pos, level, history).move);
+    history.push(key);
   }
   return 'draw';
 }
@@ -126,6 +182,7 @@ function playGame(whiteLevel, blackLevel) {
   var outcome = 'unfinished';
   var plies = 0;
   var seen = {};
+  var history = [];
   // "hard" is deterministic, so this game is identical on every run. The
   // easier levels deliberately randomise, which makes their game length vary
   // wildly — a drawn-out endgame can legitimately run past 400 plies before
@@ -140,7 +197,8 @@ function playGame(whiteLevel, blackLevel) {
     var key = pos.key();
     seen[key] = (seen[key] || 0) + 1;
     if (seen[key] >= 3) { outcome = 'threefold repetition'; break; }
-    C.makeMove(pos, AI.chooseMove(pos, 'hard').move);
+    C.makeMove(pos, AI.chooseMove(pos, 'hard', history).move);
+    history.push(key);
     plies++;
   }
   check('self-play reaches a terminal position', outcome !== 'unfinished',

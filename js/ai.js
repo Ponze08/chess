@@ -98,7 +98,10 @@
     easy:   { depth: 2, timeMs: 400,  noise: 55, quiesce: false },
     medium: { depth: 3, timeMs: 900,  noise: 22, quiesce: true  },
     hard:   { depth: 5, timeMs: 2000, noise: 0,  quiesce: true  },
-    expert: { depth: 8, timeMs: 4500, noise: 0,  quiesce: true  }
+    expert: { depth: 8, timeMs: 4500, noise: 0,  quiesce: true  },
+    // Not offered as an opponent: what the Hint button asks for. No noise,
+    // since a hint should be the best move the engine can find quickly.
+    hint:   { depth: 6, timeMs: 1200, noise: 0,  quiesce: true  }
   };
 
   // --- Evaluation -------------------------------------------------------
@@ -195,6 +198,30 @@
 
   var TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
 
+  // Caps check extensions, so a long run of checks cannot recurse unbounded.
+  var MAX_PLY = 64;
+
+  // Bounds the transposition table so a long search on a slow device cannot
+  // exhaust memory; once full, only entries already present are updated.
+  var TT_LIMIT = 1 << 20;
+
+  function isMateScore(score) { return Math.abs(score) > MATE - 1000; }
+
+  // Mate scores count plies from the root, but a table entry can be reached
+  // again at a different ply. Stored relative to the node instead, and
+  // converted back on the way out, they keep the right mate distance.
+  function scoreToTT(score, ply) {
+    if (score > MATE - 1000) return score + ply;
+    if (score < -MATE + 1000) return score - ply;
+    return score;
+  }
+
+  function scoreFromTT(score, ply) {
+    if (score > MATE - 1000) return score - ply;
+    if (score < -MATE + 1000) return score + ply;
+    return score;
+  }
+
   function Searcher() {
     this.tt = new Map();
     this.killers = [];
@@ -202,20 +229,47 @@
     this.nodes = 0;
     this.deadline = 0;
     this.aborted = false;
+    // Hashes of every position before the current node, the game so far
+    // followed by the search path, for spotting repetitions.
+    this.pathHi = [];
+    this.pathLo = [];
+    this.rootIndex = 0;   // where the root sits in the path
   }
-
-  Searcher.prototype.reset = function () {
-    this.tt.clear();
-    this.killers = [];
-    this.history = {};
-    this.nodes = 0;
-    this.aborted = false;
-  };
 
   Searcher.prototype.outOfTime = function () {
     // Checking the clock is not free, so only sample it periodically.
     if ((this.nodes & 1023) === 0 && Date.now() >= this.deadline) this.aborted = true;
     return this.aborted;
+  };
+
+  Searcher.prototype.pushPosition = function (pos) {
+    this.pathHi.push(pos.hashHi);
+    this.pathLo.push(pos.hashLo);
+  };
+
+  Searcher.prototype.popPosition = function () {
+    this.pathHi.pop();
+    this.pathLo.pop();
+  };
+
+  // True if reaching this position should count as a draw by repetition.
+  // Within the search, one repeat is enough: a line worth repeating once can
+  // be repeated again, so the engine avoids repeating when it is winning and
+  // steers into it when it is losing. A position from the game before the
+  // root must already have occurred twice, though, making this the third
+  // time: otherwise the engine would bank on a draw the opponent can simply
+  // decline.
+  Searcher.prototype.isRepetition = function (pos) {
+    var n = this.pathLo.length;
+    var stop = Math.max(0, n - pos.halfmove);
+    var earlier = 0;
+    // Only positions with the same side to move can match: every other ply.
+    for (var i = n - 2; i >= stop; i -= 2) {
+      if (this.pathLo[i] === pos.hashLo && this.pathHi[i] === pos.hashHi) {
+        if (i > this.rootIndex || ++earlier === 2) return true;
+      }
+    }
+    return false;
   };
 
   function moveKey(m) {
@@ -259,32 +313,43 @@
 
   // Search only forcing moves until the position is quiet, so the engine is
   // not fooled by a capture sequence that is cut off mid-exchange.
-  Searcher.prototype.quiescence = function (pos, alpha, beta) {
+  Searcher.prototype.quiescence = function (pos, alpha, beta, ply) {
     this.nodes++;
     if (this.outOfTime()) return 0;
 
-    var standPat = evaluate(pos);
-    if (standPat >= beta) return beta;
-    if (standPat > alpha) alpha = standPat;
-
-    var captures = C.generatePseudoMoves(pos, true);
-    captures = this.orderMoves(captures, null, 0);
     var us = pos.turn;
+    // A side in check may not "stand pat" on the static evaluation: it has
+    // to answer the check, so every evasion is tried, and having none is
+    // mate.
+    var inCheck = ply < MAX_PLY && C.inCheck(pos, us);
+    var standPat = -INF;
+    if (!inCheck) {
+      standPat = evaluate(pos);
+      if (standPat >= beta) return beta;
+      if (standPat > alpha) alpha = standPat;
+    }
 
-    for (var i = 0; i < captures.length; i++) {
-      var m = captures[i];
+    var moves = this.orderMoves(C.generatePseudoMoves(pos, !inCheck), null, ply);
+    var legalCount = 0;
+
+    for (var i = 0; i < moves.length; i++) {
+      var m = moves[i];
       // Delta pruning: skip captures that cannot plausibly raise alpha.
-      if (m.captured !== null && standPat + VALUE[C.typeOf(m.captured)] + 200 < alpha) continue;
+      if (!inCheck && m.captured !== null &&
+          standPat + VALUE[C.typeOf(m.captured)] + 200 < alpha) continue;
 
       C.makeMove(pos, m);
       if (C.inCheck(pos, us)) { C.unmakeMove(pos); continue; }
-      var score = -this.quiescence(pos, -beta, -alpha);
+      legalCount++;
+      var score = -this.quiescence(pos, -beta, -alpha, ply + 1);
       C.unmakeMove(pos);
 
       if (this.aborted) return 0;
       if (score >= beta) return beta;
       if (score > alpha) alpha = score;
     }
+
+    if (inCheck && legalCount === 0) return -MATE + ply;
     return alpha;
   };
 
@@ -292,8 +357,20 @@
     this.nodes++;
     if (this.outOfTime()) return 0;
 
-    // Draws by rule are worth exactly zero, whoever is to move.
-    if (pos.halfmove >= 100 || C.hasInsufficientMaterial(pos)) return 0;
+    var us = pos.turn;
+    var inCheck = C.inCheck(pos, us);
+
+    // Draws by rule are worth exactly zero, whoever is to move, though a
+    // mate delivered on the hundredth half-move still counts as mate.
+    if (this.isRepetition(pos) || C.hasInsufficientMaterial(pos)) return 0;
+    if (pos.halfmove >= 100) {
+      return inCheck && C.legalMoves(pos).length === 0 ? -MATE + ply : 0;
+    }
+
+    // A king in check is never a quiet place to stop: without this the
+    // search would evaluate mated positions at the horizon as if they were
+    // ordinary ones, and miss mates it had in fact reached.
+    if (inCheck && ply < MAX_PLY) depth++;
 
     var alphaOrig = alpha;
     var ttKey = pos.hashLo;
@@ -303,18 +380,18 @@
     if (entry && entry.hi === pos.hashHi) {
       ttMove = entry.move;
       if (entry.depth >= depth) {
-        if (entry.flag === TT_EXACT) return entry.score;
-        if (entry.flag === TT_LOWER && entry.score > alpha) alpha = entry.score;
-        else if (entry.flag === TT_UPPER && entry.score < beta) beta = entry.score;
-        if (alpha >= beta) return entry.score;
+        var ttScore = scoreFromTT(entry.score, ply);
+        if (entry.flag === TT_EXACT) return ttScore;
+        if (entry.flag === TT_LOWER && ttScore > alpha) alpha = ttScore;
+        else if (entry.flag === TT_UPPER && ttScore < beta) beta = ttScore;
+        if (alpha >= beta) return ttScore;
       }
     }
 
     if (depth <= 0) {
-      return useQuiescence ? this.quiescence(pos, alpha, beta) : evaluate(pos);
+      return useQuiescence ? this.quiescence(pos, alpha, beta, ply) : evaluate(pos);
     }
 
-    var us = pos.turn;
     var moves = C.generatePseudoMoves(pos, false);
     moves = this.orderMoves(moves, ttMove, ply);
 
@@ -322,6 +399,7 @@
     var bestMove = null;
     var legalCount = 0;
 
+    this.pushPosition(pos);
     for (var i = 0; i < moves.length; i++) {
       var m = moves[i];
       C.makeMove(pos, m);
@@ -341,7 +419,7 @@
       }
       C.unmakeMove(pos);
 
-      if (this.aborted) return 0;
+      if (this.aborted) break;
 
       if (score > best) {
         best = score;
@@ -356,35 +434,59 @@
         break;
       }
     }
+    this.popPosition();
+
+    if (this.aborted) return 0;
 
     if (legalCount === 0) {
       // Mate scores count from the root so shorter mates score higher.
-      return C.inCheck(pos, us) ? -MATE + ply : 0;
+      return inCheck ? -MATE + ply : 0;
     }
 
     var flag = best <= alphaOrig ? TT_UPPER : best >= beta ? TT_LOWER : TT_EXACT;
-    this.tt.set(ttKey, { hi: pos.hashHi, depth: depth, score: best, flag: flag, move: bestMove });
+    if (this.tt.size < TT_LIMIT || this.tt.has(ttKey)) {
+      this.tt.set(ttKey, {
+        hi: pos.hashHi, depth: depth, score: scoreToTT(best, ply), flag: flag, move: bestMove
+      });
+    }
 
     return best;
   };
 
-  // Picks a move for the side to move. Returns null if there are none.
-  function chooseMove(pos, levelName) {
+  // Picks a move for the side to move, or returns null if there is none.
+  // `history` holds the keys (Position#key) of the positions that came
+  // before this one in the game, oldest first, so the search knows which
+  // moves would repeat a position.
+  function chooseMove(pos, levelName, history) {
     var level = LEVELS[levelName] || LEVELS.medium;
-    var searcher = new Searcher();
-    searcher.reset();
-    searcher.deadline = Date.now() + level.timeMs;
 
     var rootMoves = C.legalMoves(pos);
     if (rootMoves.length === 0) return null;
     if (rootMoves.length === 1) {
-      return { move: rootMoves[0], score: 0, depth: 0, nodes: 0, timeMs: 0 };
+      // Forced: nothing to search, and so no score to report either.
+      return { move: rootMoves[0], score: null, depth: 0, nodes: 0, timeMs: 0 };
     }
+
+    var searcher = new Searcher();
+    searcher.deadline = Date.now() + level.timeMs;
+    (history || []).forEach(function (key) {
+      var halves = String(key).split(':');
+      searcher.pathHi.push(parseInt(halves[0], 16) >>> 0);
+      searcher.pathLo.push(parseInt(halves[1], 16) >>> 0);
+    });
+    searcher.rootIndex = searcher.pathLo.length;
+    searcher.pushPosition(pos);
+
+    // The random pick on the easier levels compares moves by score, so each
+    // move within `noise` of the best needs an exact score, not merely a
+    // bound. Widening the root window by that much provides it.
+    var margin = level.noise > 0 ? level.noise + 1 : 0;
 
     var started = Date.now();
     var best = { move: rootMoves[0], score: 0 };
     var completedDepth = 0;
     var scored = rootMoves.map(function (m) { return { move: m, score: -INF }; });
+    var completed = null;   // root scores from the deepest finished iteration
 
     for (var depth = 1; depth <= level.depth; depth++) {
       var alpha = -INF;
@@ -398,7 +500,7 @@
       for (var i = 0; i < scored.length; i++) {
         var m = scored[i].move;
         C.makeMove(pos, m);
-        var score = -searcher.negamax(pos, depth - 1, -INF, -alpha, 1, level.quiesce);
+        var score = -searcher.negamax(pos, depth - 1, -INF, -(alpha - margin), 1, level.quiesce);
         C.unmakeMove(pos);
 
         if (searcher.aborted) { aborted = true; break; }
@@ -415,16 +517,18 @@
 
       completedDepth = depth;
       best = { move: iterationBest, score: iterationScore };
+      completed = scored.map(function (s) { return { move: s.move, score: s.score }; });
 
       // A forced mate is found; no deeper search will improve on it.
-      if (Math.abs(iterationScore) > MATE - 100) break;
+      if (isMateScore(iterationScore)) break;
       if (Date.now() >= searcher.deadline) break;
     }
 
-    // On the easier levels, pick randomly among moves close to the best one.
-    if (level.noise > 0) {
-      var pool = scored.filter(function (s) {
-        return s.score > -INF && s.score >= best.score - level.noise;
+    // On the easier levels, pick randomly among moves close to the best one
+    // — but never wander away from a forced mate.
+    if (level.noise > 0 && completed && !isMateScore(best.score)) {
+      var pool = completed.filter(function (s) {
+        return s.score >= best.score - level.noise;
       });
       if (pool.length > 1) {
         var pick = pool[Math.floor(Math.random() * pool.length)];
